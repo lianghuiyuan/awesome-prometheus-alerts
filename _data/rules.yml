@@ -65,6 +65,10 @@ services:
             description: Context switching is growing on node (> 1000 / s)
             query: 'rate(node_context_switches_total[5m]) > 1000'
             severity: warning
+            comments: |
+              1000 context switches is an arbitrary number.
+              Alert threshold depends on nature of application.
+              Please read: https://github.com/samber/awesome-prometheus-alerts/issues/58
           - name: Swap is filling up
             description: Swap is filling up (>80%)
             query: '(1 - (node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes)) * 100 > 80'
@@ -73,6 +77,15 @@ services:
             description: 'SystemD service crashed'
             query: 'node_systemd_unit_state{state="failed"} == 1'
             severity: warning
+          - name: Physical component too hot
+            description: 'Physical hardware component too hot'
+            query: 'node_hwmon_temp_celsius > 75'
+            severity: warning
+          - name: Node overtemperature alarm
+            description: 'Physical node temperature alarm triggered'
+            query: 'node_hwmon_temp_alarm == 1'
+            severity: critical
+
 
   - name: Docker containers
     exporters:
@@ -125,7 +138,7 @@ services:
             severity: error
           - name: Cluster down
             description: Less than 3 nodes running in RabbitMQ cluster
-            query: 'rabbitmq_running < 3'
+            query: 'sum(rabbitmq_running) < 3'
             severity: error
           - name: Cluster partition
             description: Cluster partition
@@ -206,6 +219,10 @@ services:
           - name: Slow queries
             description: PostgreSQL executes slow queries (> 1min)
             query: 'avg(rate(pg_stat_activity_max_tx_duration{datname!~"template.*"}[1m])) BY (datname) > 60'
+            severity: warning
+          - name: High rollback rate
+            description: Ratio of transactions being aborted compared to committed is > 2 %
+            query: 'rate(pg_stat_database_xact_rollback{datname!~"template.*"}[3m]) / rate(pg_stat_database_xact_commit{datname!~"template.*"}[3m]) > 0.02'
             severity: warning
 
   - name: Redis
@@ -339,8 +356,14 @@ services:
             severity: warning
           - name: Elastic no new documents
             description: No new documents for 10 min!
-            query: 'rate(elasticsearch_indices_docs{es_master_node="false"}[10m]) < 1'
+            query: 'rate(elasticsearch_indices_docs{es_data_node="true"}[10m]) < 1'
             severity: warning
+
+  - name: Cassandra
+    exporters:
+      - name: criteo/cassandra_exporter
+        doc_url: https://github.com/criteo/cassandra_exporter
+        rules:
 
   - name: Apache
     exporters:
@@ -360,11 +383,11 @@ services:
         - name: Traefik backend down
           description: All Traefik backends are down
           query: 'count(traefik_backend_server_up) by (backend) == 0'
-          severity: critical
+          severity: error
         - name: Traefik backend errors
           description: Traefik backend error rate is above 10%
           query: 'sum(rate(traefik_backend_requests_total{code=~"5.*"}[5m])) by (backend) / sum(rate(traefik_backend_requests_total[5m])) by (backend) > 0.1'
-          severity: critical
+          severity: error
 
   - name: PHP-FPM
     exporters:
@@ -384,14 +407,39 @@ services:
 
   - name: ZFS
     exporters:
-      - name: node-exporteer
+      - name: node-exporter
         doc_url: https://github.com/prometheus/node_exporter
         rules:
 
   - name: Kubernetes
     exporters:
-      - name: kubelet
+      - name: kube-state-metrics
+        doc_url: https://github.com/kubernetes/kube-state-metrics/tree/master/docs
         rules:
+          - name: Kubernetes MemoryPressure
+            description: '{{ $labels.node }} has MemoryPressure condition'
+            query: 'kube_node_status_condition{condition="MemoryPressure",status="true"} == 1'
+            severity: error
+          - name: Kubernetes DiskPressure
+            description: '{{ $labels.node }} has DiskPressure condition'
+            query: 'kube_node_status_condition{condition="DiskPressure",status="true"} == 1'
+            severity: error
+          - name: Kubernetes OutOfDisk
+            description: '{{ $labels.node }} has OutOfDisk condition'
+            query: 'kube_node_status_condition{condition="OutOfDisk",status="true"} == 1'
+            severity: error
+          - name: Kubernetes Job failed
+            description: 'Job {{$labels.namespace}}/{{$labels.exported_job}} failed to complete'
+            query: 'kube_job_status_failed > 0'
+            severity: warning
+          - name: Kubernetes CronJob suspended
+            description: 'CronJob {{ $labels.namespace }}/{{ $labels.cronjob }} is suspended'
+            query: 'kube_cronjob_spec_suspend != 0'
+            severity: info
+          - name: Kubernetes PersistentVolumeClaim pending
+            description: 'PersistentVolumeClaim {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }} is pending'
+            query: 'kube_persistentvolumeclaim_status_phase{phase="Pending"} == 1'
+            severity: warning
           - name: Volume out of disk space
             description: Volume is almost full (< 10% left)
             query: 'kubelet_volume_stats_available_bytes / kubelet_volume_stats_capacity_bytes * 100 < 10'
@@ -518,7 +566,11 @@ services:
             description: Probe failed
             query: probe_success == 0
             severity: error
-          - name: Status Code
+          - name: Slow probe
+            description: Blackbox probe took more than 1s to complete
+            query: 'avg_over_time(probe_duration_seconds[1m]) > 1'
+            severity: warning
+          - name: HTTP Status Code
             description: HTTP status code is not 200-399
             query: 'probe_http_status_code <= 199 OR probe_http_status_code >= 400'
             severity: error
@@ -526,17 +578,17 @@ services:
             description: SSL certificate expires in 30 days
             query: 'probe_ssl_earliest_cert_expiry - time() < 86400 * 30'
             severity: warning
-          - name: SSL certificate has expired
+          - name: SSL certificate expired
             description: SSL certificate has expired already
             query: 'probe_ssl_earliest_cert_expiry - time()  <= 0'
             severity: error
-          - name: Blackbox slow requests
-            description: Blackbox request took more than 2s
-            query: 'probe_http_duration_seconds > 2'
+          - name: HTTP slow requests
+            description: HTTP request took more than 1s
+            query: 'avg_over_time(probe_http_duration_seconds[1m]) > 1'
             severity: warning
-          - name: Blackbox slow ping
-            description: Blackbox ping took more than 2s
-            query: 'probe_icmp_duration_seconds > 2'
+          - name: Slow ping
+            description: Blackbox ping took more than 1s
+            query: 'avg_over_time(probe_icmp_duration_seconds[1m]) > 1'
             severity: warning
 
   - name: Windows Server
